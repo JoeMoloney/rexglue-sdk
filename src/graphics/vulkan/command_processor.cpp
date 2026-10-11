@@ -4350,12 +4350,23 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFenceAndDeviceLoss(0);
-  bool previous_slot_ready =
+  bool previous_slot_written =
       readback.buffers[read_index] != VK_NULL_HANDLE &&
       readback.memories[read_index] != VK_NULL_HANDLE &&
       readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
-      total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
-      readback.submission_written[read_index] <= submission_completed_;
+      total_size <= readback.written_size[read_index] && readback.submission_written[read_index] != 0;
+  if (previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
+      readback.submission_written[read_index] > submission_completed_ &&
+      readback.submission_written[read_index] < GetCurrentSubmission()) {
+    // The previous copy was submitted but is still in flight. Wait for it
+    // instead of falling back to the current draw, so the data the guest reads
+    // is always one memexport draw old, whether or not the GPU has caught up.
+    // A copy recorded in the still-open submission is left to the full path
+    // below, as without this cvar, so the open submission is never ended here.
+    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index]);
+  }
+  bool previous_slot_ready =
+      previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;

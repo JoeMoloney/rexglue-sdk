@@ -17,6 +17,7 @@
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
+REXCVAR_DECLARE(bool, half_pixel_offset_host_scaled);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, async_pipeline_wait);
 REXCVAR_DECLARE(int32_t, async_pipeline_wait_timeout_ms);
@@ -32,6 +33,7 @@ REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(std::string, readback_resolve_force_addresses);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
+REXCVAR_DECLARE(bool, readback_memexport_fast_wait);
 REXCVAR_DECLARE(bool, occlusion_query_enable);
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 

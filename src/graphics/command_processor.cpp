@@ -86,6 +86,14 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_memexport_fast_wait, true, "GPU",
+                    "With readback_memexport_fast, wait for the previous memexport copy when "
+                    "the GPU has not finished it yet, instead of reading the current draw. "
+                    "The guest then always sees the data from one memexport draw back, at any "
+                    "frame rate, rather than alternating between the previous and the current "
+                    "draw depending on how far the GPU is behind.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
                      "Fake sample count for occlusion queries")
     .range(1, 100000)
