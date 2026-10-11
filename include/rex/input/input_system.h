@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -65,6 +66,11 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  // Xam input entries execute on whatever guest thread made the call, and
+  // several guest threads can enter RefreshDevices concurrently. Recursive
+  // because the locked public methods re-enter through RefreshDevices.
+  mutable std::recursive_mutex mutex_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.
