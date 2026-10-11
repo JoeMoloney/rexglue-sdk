@@ -140,6 +140,7 @@ EXPORTS
 ?QueryHostTickFrequency@Clock@chrono@rex@@SA_KXZ
 ?QueryHostUptimeMillis@Clock@chrono@rex@@SA_KXZ
 ?QueryRangeAccess@BaseHeap@memory@rex@@QEAA?AW4PageAccess@23@II@Z
+?QueryRegionInfo@BaseHeap@memory@rex@@QEAA_NIPEAUHeapAllocationInfo@23@@Z
 ?QuitFromUIThread@WindowedAppContext@ui@rex@@QEAAXXZ
 ?Read@ByteStream@stream@rex@@QEAAXV?$span@E$0?0@std@@@Z
 ?Reclaim@D3D12DescriptorHeapPool@d3d12@ui@rex@@QEAAX_K@Z
