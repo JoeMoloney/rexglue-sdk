@@ -63,14 +63,9 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
     .allowed({"none", "fast", "some", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, true, "GPU",
+REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
-                    "scaled block during resolve readback downscale. With the D3D9-style "
-                    "half-pixel offset, the content of each guest pixel starts at host pixel "
-                    "(scale/2, scale/2) of its block, so the block's top-left host pixel "
-                    "belongs to the previous guest pixel, and the first row and column of "
-                    "the resolve read the uncovered edge (a line along the top of the "
-                    "screen at 2x in Fable II)")
+                    "scaled block during resolve readback downscale")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(readback_resolve_force_addresses, "", "GPU",
