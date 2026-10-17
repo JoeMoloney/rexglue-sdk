@@ -1,0 +1,9 @@
+// Vulkan 1.2 extended dynamic state functions.
+XE_UI_VULKAN_FUNCTION(vkCmdSetPrimitiveTopology)
+XE_UI_VULKAN_FUNCTION(vkCmdSetPrimitiveRestartEnable)
+XE_UI_VULKAN_FUNCTION(vkCmdSetRasterizerDiscardEnable)
+XE_UI_VULKAN_FUNCTION(vkCmdSetDepthTestEnable)
+XE_UI_VULKAN_FUNCTION(vkCmdSetDepthWriteEnable)
+XE_UI_VULKAN_FUNCTION(vkCmdSetDepthCompareOp)
+XE_UI_VULKAN_FUNCTION(vkCmdSetCullMode)
+XE_UI_VULKAN_FUNCTION(vkCmdSetFrontFace)

@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_extended_dynamic_state, true, "GPU/Vulkan",
+                    "Use Vulkan 1.2 extended dynamic state to minimize pipeline variants. "
+                    "Requires Vulkan 1.2+ device. Set to false to restore baked state.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -1102,6 +1107,22 @@ bool VulkanPipelineCache::ConfigurePipeline(
         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
     return false;
   }
+
+  // Extended dynamic state (Fable 2 custom renderer): zero out fields that are
+  // set dynamically at draw time so they don't contribute to the pipeline key.
+  // This collapses many state variants into a single pipeline object.
+  if (REXCVAR_GET(vulkan_extended_dynamic_state) &&
+      command_processor_.GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr) {
+    description.primitive_topology = PipelinePrimitiveTopology(0);
+    description.primitive_restart = 0;
+    description.cull_front = 0;
+    description.cull_back = 0;
+    description.front_face_clockwise = 0;
+    description.rasterizer_discard = 0;
+    description.depth_write_enable = 0;
+    description.depth_compare_op = xenos::CompareFunction(0);
+  }
+
   if (last_pipeline_ && last_pipeline_->first == description) {
     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
     const PipelineLayoutProvider* last_pipeline_layout =
@@ -3399,7 +3420,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     color_blend_state.pAttachments = color_blend_attachments;
   }
 
-  std::array<VkDynamicState, 7> dynamic_states;
+  // Extended dynamic state (Fable 2 custom renderer): make topology, depth,
+  // and cull state dynamic to minimize the number of unique VkPipeline
+  // objects. This reduces pipeline switch overhead on the GPU.
+  std::array<VkDynamicState, 18> dynamic_states;
   VkPipelineDynamicStateCreateInfo dynamic_state;
   dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
   dynamic_state.pNext = nullptr;
@@ -3412,6 +3436,21 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // invalidated (again, even if it has no effect).
   dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT;
   dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR;
+  // Extended dynamic state (Fable 2 custom renderer): only add the Vulkan 1.2
+  // states when the cvar is enabled and the device supports them.
+  bool extended_dynamic_state =
+      REXCVAR_GET(vulkan_extended_dynamic_state) &&
+      command_processor_.GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr;
+  if (extended_dynamic_state) {
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE;
+  }
   if (!edram_fragment_shader_interlock) {
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;

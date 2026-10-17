@@ -314,6 +314,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kVkSetExtendedDynamicState: {
+        auto& args = *reinterpret_cast<const ArgsVkSetExtendedDynamicState*>(stream);
+        dfn.vkCmdSetPrimitiveTopology(command_buffer, args.topology);
+        dfn.vkCmdSetPrimitiveRestartEnable(command_buffer, args.primitive_restart_enable);
+        dfn.vkCmdSetRasterizerDiscardEnable(command_buffer, args.rasterizer_discard_enable);
+        dfn.vkCmdSetDepthTestEnable(command_buffer, args.depth_test_enable);
+        dfn.vkCmdSetDepthWriteEnable(command_buffer, args.depth_write_enable);
+        dfn.vkCmdSetDepthCompareOp(command_buffer, args.depth_compare_op);
+        dfn.vkCmdSetCullMode(command_buffer, args.cull_mode);
+        dfn.vkCmdSetFrontFace(command_buffer, args.front_face);
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;

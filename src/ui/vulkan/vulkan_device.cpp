@@ -772,6 +772,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include <rex/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc>
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
   }
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+#include <rex/ui/vulkan/functions/device_1_2_extended_dynamic_state.inc>
+  }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>

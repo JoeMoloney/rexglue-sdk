@@ -351,6 +351,27 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
   }
 
+  // Extended dynamic state (Fable 2 custom renderer): sets topology, depth,
+  // rasterization, and cull state in a single command to minimize pipeline
+  // variants. Polygon mode and color write mask remain static (baked into
+  // the pipeline) because the vendored headers use EXT names for those.
+  struct ArgsVkSetExtendedDynamicState {
+    VkPrimitiveTopology topology;
+    VkBool32 primitive_restart_enable;
+    VkBool32 rasterizer_discard_enable;
+    VkBool32 depth_test_enable;
+    VkBool32 depth_write_enable;
+    VkCompareOp depth_compare_op;
+    VkCullModeFlags cull_mode;
+    VkFrontFace front_face;
+  };
+
+  void CmdVkSetExtendedDynamicState(const ArgsVkSetExtendedDynamicState& state) {
+    auto& args = *reinterpret_cast<ArgsVkSetExtendedDynamicState*>(
+        WriteCommand(Command::kVkSetExtendedDynamicState, sizeof(ArgsVkSetExtendedDynamicState)));
+    args = state;
+  }
+
  private:
   enum class Command {
     kVkBeginRenderPass,
@@ -381,6 +402,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kVkSetExtendedDynamicState,
   };
 
   struct CommandHeader {

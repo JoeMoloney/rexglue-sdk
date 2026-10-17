@@ -46,7 +46,16 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+// Cvar defined in pipeline_cache.cpp.
+REXCVAR_DECLARE(bool, vulkan_extended_dynamic_state);
+
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_UINT64(vulkan_fence_timeout_ns, 0, "GPU/Vulkan",
+                       "Maximum time (ns) to block waiting for a submission fence before "
+                       "proceeding. 0 = infinite (original behavior). Set to a finite value "
+                       "(e.g. 1000000000 = 1s) to avoid permanent hangs on a stuck GPU.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -3874,6 +3883,47 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
   }
 
+  // Extended dynamic state (Fable 2 custom renderer): set topology, depth,
+  // rasterization, and color write mask dynamically to minimize the number
+  // of unique VkPipeline objects.
+  if (REXCVAR_GET(vulkan_extended_dynamic_state) &&
+      GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr) {
+    DeferredCommandBuffer::ArgsVkSetExtendedDynamicState ext_state;
+    // Topology from the primitive processing result.
+    switch (primitive_processing_result.host_primitive_type) {
+      case xenos::PrimitiveType::kPointList:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+      case xenos::PrimitiveType::kLineList:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+      case xenos::PrimitiveType::kLineStrip:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+      case xenos::PrimitiveType::kTriangleList:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+      case xenos::PrimitiveType::kTriangleStrip:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+      default:
+        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    }
+    ext_state.primitive_restart_enable = VK_FALSE;
+    ext_state.rasterizer_discard_enable = is_rasterization_done ? VK_FALSE : VK_TRUE;
+    // Depth state from the normalized depth control register.
+    auto pa_sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    bool depth_test_on = normalized_depth_control.z_enable ||
+                         normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
+    ext_state.depth_test_enable = depth_test_on ? VK_TRUE : VK_FALSE;
+    ext_state.depth_write_enable = normalized_depth_control.z_write_enable ? VK_TRUE : VK_FALSE;
+    ext_state.depth_compare_op = VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
+                                             uint32_t(normalized_depth_control.zfunc));
+    // Rasterization state from guest registers.
+    ext_state.cull_mode = VK_CULL_MODE_NONE;
+    if (pa_sc.cull_front) ext_state.cull_mode |= VK_CULL_MODE_FRONT_BIT;
+    if (pa_sc.cull_back) ext_state.cull_mode |= VK_CULL_MODE_BACK_BIT;
+    ext_state.front_face = pa_sc.face != 0
+                               ? VK_FRONT_FACE_CLOCKWISE
+                               : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    deferred_command_buffer_.CmdVkSetExtendedDynamicState(ext_state);
+  }
+
   // Update the graphics pipeline, and if the new graphics pipeline has a
   // different layout, invalidate incompatible descriptor sets before updating
   // current_guest_graphics_pipeline_layout_.
@@ -4983,11 +5033,21 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    // W10 performance: Use a finite timeout to avoid serializing CPU encoding
+    // with GPU execution. On timeout, proceed without the fence (the frame
+    // will be dropped or delayed, but the CPU is not stalled).
+    const uint64_t timeout_ns = REXCVAR_GET(vulkan_fence_timeout_ns);
+    const uint64_t wait_timeout = (timeout_ns == 0) ? UINT64_MAX : timeout_ns;
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+                            submissions_in_flight_fences_.data(), VK_TRUE, wait_timeout);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
+    } else if (wait_result == VK_TIMEOUT) {
+      // Fence not signaled within the timeout. Proceed without it — the GPU
+      // will catch up, and the frame may be dropped. This avoids stalling the
+      // CPU thread for the full GPU frame time.
+      fences_awaited = 0;
     } else {
       REXGPU_ERROR("Failed to await submission completion Vulkan fences");
       if (wait_result == VK_ERROR_DEVICE_LOST) {

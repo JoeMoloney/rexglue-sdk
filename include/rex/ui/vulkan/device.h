@@ -210,6 +210,8 @@ class VulkanDevice {
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
   PFN_##core_name core_name = nullptr;
 #include <rex/ui/vulkan/functions/device_1_0.inc>
+    // Vulkan 1.2 extended dynamic state
+#include <rex/ui/vulkan/functions/device_1_2_extended_dynamic_state.inc>
     // VK_KHR_swapchain (#2)
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
