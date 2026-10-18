@@ -389,6 +389,25 @@ class VulkanTextureCache final : public TextureCache {
   std::vector<uint64_t> scaled_resolve_sparse_allocated_;
   bool scaled_resolve_last_usage_write_ = false;
   std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
+
+  // Realtime texture morphing: when set, textures whose base_page matches
+  // this address will return this VkImageView instead of their own (so the
+  // hero/dog mesh samples the render target's VkImage directly).
+  VkImageView realtime_morph_override_view_ = VK_NULL_HANDLE;
+  uint32_t realtime_morph_override_base_page_ = 0;
+
+ public:
+  void SetRealtimeMorphOverride(uint32_t base_page, VkImageView view) {
+    realtime_morph_override_base_page_ = base_page;
+    realtime_morph_override_view_ = view;
+  }
+  VkImageView GetRealtimeMorphOverride(uint32_t base_page) const {
+    return (realtime_morph_override_base_page_ == base_page) ? realtime_morph_override_view_
+                                                             : VK_NULL_HANDLE;
+  }
+  // Find a texture's VkImage by base_page (for GPU-to-GPU copy after resolve).
+  VkImage FindImageByBasePage(uint32_t base_page) const;
+  void MarkAllTexturesOutdated() { texture_became_outdated_.store(true, std::memory_order_release); }
 };
 
 }  // namespace rex::graphics::vulkan

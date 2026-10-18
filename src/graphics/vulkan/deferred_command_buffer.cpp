@@ -13,6 +13,12 @@
 #include <cstdint>
 #include <cstring>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
@@ -21,6 +27,64 @@
 #include <rex/math.h>
 
 namespace rex::graphics::vulkan {
+
+// Vulkan 1.2 extended dynamic state function pointers (Fable 2 custom renderer).
+// These are NOT in the SDK's Functions struct (ABI compatibility with the
+// prebuilt runtime), so they are resolved separately via the Vulkan loader.
+struct ExtendedDynamicStateFns {
+  PFN_vkCmdSetPrimitiveTopology SetPrimitiveTopology = nullptr;
+  PFN_vkCmdSetPrimitiveRestartEnable SetPrimitiveRestartEnable = nullptr;
+  PFN_vkCmdSetRasterizerDiscardEnable SetRasterizerDiscardEnable = nullptr;
+  PFN_vkCmdSetDepthTestEnable SetDepthTestEnable = nullptr;
+  PFN_vkCmdSetDepthWriteEnable SetDepthWriteEnable = nullptr;
+  PFN_vkCmdSetDepthCompareOp SetDepthCompareOp = nullptr;
+  PFN_vkCmdSetCullMode SetCullMode = nullptr;
+  PFN_vkCmdSetFrontFace SetFrontFace = nullptr;
+};
+
+const ExtendedDynamicStateFns& GetExtendedDynamicStateFns(VkDevice device) {
+  static ExtendedDynamicStateFns fns;
+  static bool resolved = false;
+  if (!resolved) {
+    resolved = true;
+    PFN_vkGetDeviceProcAddr get_proc = nullptr;
+#ifdef _WIN32
+    if (HMODULE mod = ::GetModuleHandleW(L"vulkan-1.dll")) {
+      get_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+          ::GetProcAddress(mod, "vkGetDeviceProcAddr"));
+    }
+#else
+    void* handle = dlopen("libvulkan.so.1", RTLD_NOW);
+    if (handle) {
+      get_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(handle, "vkGetDeviceProcAddr"));
+    }
+#endif
+    if (get_proc && device != VK_NULL_HANDLE) {
+      fns.SetPrimitiveTopology =
+          reinterpret_cast<PFN_vkCmdSetPrimitiveTopology>(get_proc(device, "vkCmdSetPrimitiveTopology"));
+      fns.SetPrimitiveRestartEnable =
+          reinterpret_cast<PFN_vkCmdSetPrimitiveRestartEnable>(get_proc(device, "vkCmdSetPrimitiveRestartEnable"));
+      fns.SetRasterizerDiscardEnable =
+          reinterpret_cast<PFN_vkCmdSetRasterizerDiscardEnable>(get_proc(device, "vkCmdSetRasterizerDiscardEnable"));
+      fns.SetDepthTestEnable =
+          reinterpret_cast<PFN_vkCmdSetDepthTestEnable>(get_proc(device, "vkCmdSetDepthTestEnable"));
+      fns.SetDepthWriteEnable =
+          reinterpret_cast<PFN_vkCmdSetDepthWriteEnable>(get_proc(device, "vkCmdSetDepthWriteEnable"));
+      fns.SetDepthCompareOp =
+          reinterpret_cast<PFN_vkCmdSetDepthCompareOp>(get_proc(device, "vkCmdSetDepthCompareOp"));
+      fns.SetCullMode =
+          reinterpret_cast<PFN_vkCmdSetCullMode>(get_proc(device, "vkCmdSetCullMode"));
+      fns.SetFrontFace =
+          reinterpret_cast<PFN_vkCmdSetFrontFace>(get_proc(device, "vkCmdSetFrontFace"));
+    }
+  }
+  return fns;
+}
+
+bool fable2_ext_dyn_state_available(VkDevice device) {
+  const auto& fns = GetExtendedDynamicStateFns(device);
+  return fns.SetPrimitiveTopology != nullptr;
+}
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
@@ -154,6 +218,46 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const VkBufferImageCopy*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+      } break;
+
+      case Command::kVkCopyImage: {
+        auto& args = *reinterpret_cast<const DeferredCommandBuffer::ArgsVkCopyImage*>(stream);
+        // Resolve vkCmdCopyImage manually (not in Functions struct for ABI compat).
+        static PFN_vkCmdCopyImage copy_image_fn = nullptr;
+        static bool resolved = false;
+        if (!resolved) {
+          resolved = true;
+#ifdef _WIN32
+          if (HMODULE mod = ::GetModuleHandleW(L"vulkan-1.dll")) {
+            auto get_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                ::GetProcAddress(mod, "vkGetDeviceProcAddr"));
+            if (get_proc) {
+              copy_image_fn = reinterpret_cast<PFN_vkCmdCopyImage>(
+                  get_proc(command_processor_.GetVulkanDevice()->device(),
+                           "vkCmdCopyImage"));
+            }
+          }
+#else
+          void* handle = dlopen("libvulkan.so.1", RTLD_NOW);
+          if (handle) {
+            auto get_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                dlsym(handle, "vkGetDeviceProcAddr"));
+            if (get_proc) {
+              copy_image_fn = reinterpret_cast<PFN_vkCmdCopyImage>(
+                  get_proc(command_processor_.GetVulkanDevice()->device(),
+                           "vkCmdCopyImage"));
+            }
+          }
+#endif
+        }
+        if (copy_image_fn) {
+          copy_image_fn(
+              command_buffer, args.src_image, args.src_image_layout,
+              args.dst_image, args.dst_image_layout, args.region_count,
+              reinterpret_cast<const VkImageCopy*>(
+                  reinterpret_cast<const uint8_t*>(stream) +
+                  rex::align(sizeof(DeferredCommandBuffer::ArgsVkCopyImage), alignof(VkImageCopy))));
+        }
       } break;
 
       case Command::kVkCopyQueryPoolResults: {
@@ -316,14 +420,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkSetExtendedDynamicState: {
         auto& args = *reinterpret_cast<const ArgsVkSetExtendedDynamicState*>(stream);
-        dfn.vkCmdSetPrimitiveTopology(command_buffer, args.topology);
-        dfn.vkCmdSetPrimitiveRestartEnable(command_buffer, args.primitive_restart_enable);
-        dfn.vkCmdSetRasterizerDiscardEnable(command_buffer, args.rasterizer_discard_enable);
-        dfn.vkCmdSetDepthTestEnable(command_buffer, args.depth_test_enable);
-        dfn.vkCmdSetDepthWriteEnable(command_buffer, args.depth_write_enable);
-        dfn.vkCmdSetDepthCompareOp(command_buffer, args.depth_compare_op);
-        dfn.vkCmdSetCullMode(command_buffer, args.cull_mode);
-        dfn.vkCmdSetFrontFace(command_buffer, args.front_face);
+        const auto& ext_fns = GetExtendedDynamicStateFns(
+            command_processor_.GetVulkanDevice()->device());
+        if (ext_fns.SetRasterizerDiscardEnable) {
+          ext_fns.SetRasterizerDiscardEnable(command_buffer, args.rasterizer_discard_enable);
+          ext_fns.SetCullMode(command_buffer, args.cull_mode);
+          ext_fns.SetFrontFace(command_buffer, args.front_face);
+        }
       } break;
 
       default:

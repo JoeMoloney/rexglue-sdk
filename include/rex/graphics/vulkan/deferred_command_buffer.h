@@ -210,6 +210,31 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+  };
+
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout,
+                      VkImage dst_image, VkImageLayout dst_image_layout,
+                      uint32_t region_count, const VkImageCopy* regions) {
+    size_t header_size = sizeof(ArgsVkCopyImage);
+    size_t args_size = header_size + sizeof(VkImageCopy) * region_count;
+    uint8_t* args_ptr =
+        reinterpret_cast<uint8_t*>(WriteCommand(Command::kVkCopyImage, args_size));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    std::memcpy(args_ptr + rex::align(header_size, alignof(VkImageCopy)),
+                regions, sizeof(VkImageCopy) * region_count);
+  }
+
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
                                  VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                                  VkQueryResultFlags flags) {
@@ -384,6 +409,7 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkCopyImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,

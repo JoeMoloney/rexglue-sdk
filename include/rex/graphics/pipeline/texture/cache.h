@@ -53,7 +53,12 @@ namespace rex::graphics {
 // TODO(Triang3l): Attach the largest LOD to existing textures with a valid
 // mip_address but no base ever used yet (no base_address) to save memory
 // because textures are streamed this way anyway.
+namespace vulkan {
+  class VulkanTextureCache;
+}
+
 class TextureCache {
+  friend class vulkan::VulkanTextureCache;
  public:
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for

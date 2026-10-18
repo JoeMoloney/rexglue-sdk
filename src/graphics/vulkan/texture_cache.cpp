@@ -3258,4 +3258,13 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
   return clamp_mode;
 }
 
+VkImage VulkanTextureCache::FindImageByBasePage(uint32_t base_page) const {
+  for (const auto& [key, texture] : textures_) {
+    if (key.base_page == base_page) {
+      return static_cast<const VulkanTexture*>(texture.get())->image();
+    }
+  }
+  return VK_NULL_HANDLE;
+}
+
 }  // namespace rex::graphics::vulkan

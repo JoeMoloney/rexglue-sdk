@@ -1163,6 +1163,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
+      // Debug: log resolve info for the hero/dog address.
+      if (resolve_info.copy_dest_base >= 0x12700000 && resolve_info.copy_dest_base < 0x12710000) {
+        static int s_resolve_debug = 0;
+        if (s_resolve_debug < 5) {
+          REXGPU_INFO("[fable2-vk] Resolve: copy_dest_base={:#010x} path={} "
+                      "extent_start={:#010x} extent_len={} copy_shader={}",
+                      resolve_info.copy_dest_base, uint32_t(GetPath()),
+                      resolve_info.copy_dest_extent_start,
+                      resolve_info.copy_dest_extent_length, uint32_t(copy_shader));
+          ++s_resolve_debug;
+        }
+      }
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
@@ -1184,6 +1196,27 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
             return false;
+          }
+
+        }
+      }
+
+      // Realtime texture morphing: set the texture override so the hero/dog
+      // mesh samples the host render target's VkImage directly.
+      if (resolve_info.copy_dest_base == 0x12704000 && !dump_rectangles_.empty()) {
+        for (const auto& rect : dump_rectangles_) {
+          const auto* rt = static_cast<const VulkanRenderTarget*>(rect.render_target);
+          if (rt && !rt->key().is_depth) {
+            VkImageView morph_view = rt->view_color_transfer();
+            if (morph_view != VK_NULL_HANDLE) {
+              texture_cache.SetRealtimeMorphOverride(0x12704, morph_view);
+              static int s_morph_override_logged = 0;
+              if (s_morph_override_logged++ < 5) {
+                REXGPU_INFO("[fable2-vk] Set morph override: view={} rt_img={}",
+                            (void*)morph_view, (void*)rt->image());
+              }
+              break;
+            }
           }
         }
       }
@@ -1230,6 +1263,14 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         // possible.
         VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
             VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
+        if (resolve_info.copy_dest_base == 0x12704000) {
+            static int s_desc_logged = 0;
+            if (s_desc_logged++ < 3) {
+              REXGPU_INFO("[fable2-vk] Resolve desc: dst={} scaled={} copy_dest_base={:#010x}",
+                          (void*)descriptor_set_dest, draw_resolution_scaled,
+                          resolve_info.copy_dest_base);
+            }
+        }
         if (descriptor_set_dest != VK_NULL_HANDLE) {
           // Write the destination descriptor.
           VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
@@ -1284,6 +1325,85 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           }
           command_processor_.SubmitBarriers(true);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+
+          // Realtime texture morphing: copy the host render target's VkImage
+          // to the texture cache's VkImage for the hero/dog.
+          if (resolve_info.copy_dest_base == 0x12704000 && !dump_rectangles_.empty()) {
+            VkImage morph_dst = texture_cache.FindImageByBasePage(0x12704);
+            const auto* morph_rt = static_cast<const VulkanRenderTarget*>(
+                dump_rectangles_[0].render_target);
+            if (morph_dst != VK_NULL_HANDLE && morph_rt &&
+                morph_rt->image() != VK_NULL_HANDLE) {
+              VkImage morph_src_img = morph_rt->image();
+              uint32_t morph_width = resolve_info.coordinate_info.width_div_8 * 8;
+              uint32_t morph_height = resolve_info.height_div_8 * 8;
+              // Barrier: transition dst to TRANSFER_DST (src is already in
+              // SHADER_READ_ONLY from the DumpRenderTargets pass).
+              VkImageMemoryBarrier dst_barrier = {};
+              dst_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              dst_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              dst_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+              dst_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              dst_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              dst_barrier.image = morph_dst;
+              dst_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              dst_barrier.subresourceRange.baseMipLevel = 0;
+              dst_barrier.subresourceRange.levelCount = 1;
+              dst_barrier.subresourceRange.baseArrayLayer = 0;
+              dst_barrier.subresourceRange.layerCount = 1;
+              dst_barrier.srcAccessMask = 0;
+              dst_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              command_buffer.CmdVkPipelineBarrier(
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                  1, &dst_barrier);
+              VkImageCopy morph_region = {};
+              morph_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              morph_region.srcSubresource.mipLevel = 0;
+              morph_region.srcSubresource.baseArrayLayer = 0;
+              morph_region.srcSubresource.layerCount = 1;
+              morph_region.srcOffset = {0, 0, 0};
+              morph_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              morph_region.dstSubresource.mipLevel = 0;
+              morph_region.dstSubresource.baseArrayLayer = 0;
+              morph_region.dstSubresource.layerCount = 1;
+              morph_region.dstOffset = {0, 0, 0};
+              morph_region.extent = {morph_width, morph_height, 1};
+              command_buffer.CmdVkCopyImage(
+                  morph_src_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  morph_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &morph_region);
+              // Transition dst back to SHADER_READ_ONLY_OPTIMAL.
+              VkImageMemoryBarrier dst_barrier2 = {};
+              dst_barrier2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              dst_barrier2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+              dst_barrier2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              dst_barrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              dst_barrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              dst_barrier2.image = morph_dst;
+              dst_barrier2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              dst_barrier2.subresourceRange.baseMipLevel = 0;
+              dst_barrier2.subresourceRange.levelCount = 1;
+              dst_barrier2.subresourceRange.baseArrayLayer = 0;
+              dst_barrier2.subresourceRange.layerCount = 1;
+              dst_barrier2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              dst_barrier2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+              command_buffer.CmdVkPipelineBarrier(
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                  nullptr, 1, &dst_barrier2);
+              static int s_morph_copy_logged = 0;
+              if (s_morph_copy_logged++ < 5) {
+                REXGPU_INFO("[fable2-vk] Morph img-to-img: src={} dst={} {}x{} "
+                            "rt_key(base=0x{:x} pitch={} msaa={}) dump_count={}",
+                            (void*)morph_src_img, (void*)morph_dst,
+                            morph_width, morph_height,
+                            morph_rt->key().base_tiles,
+                            morph_rt->key().pitch_tiles_at_32bpp,
+                            uint32_t(morph_rt->key().msaa_samples),
+                            dump_rectangles_.size());
+              }
+            }
+          }
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -6025,6 +6145,17 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  // Debug: log dump info for the hero/dog address range.
+  if (dump_base >= 0x12700000 && dump_base < 0x12710000) {
+    static int s_dump_debug = 0;
+    if (s_dump_debug < 8) {
+      REXGPU_INFO("[fable2-vk] DumpRenderTargets: base={:#010x} rows={} pitch={} "
+                  "rects={} path={}",
+                  dump_base, dump_rows, dump_pitch, dump_rectangles_.size(),
+                  uint32_t(GetPath()));
+      ++s_dump_debug;
+    }
+  }
   if (dump_rectangles_.empty()) {
     return true;
   }

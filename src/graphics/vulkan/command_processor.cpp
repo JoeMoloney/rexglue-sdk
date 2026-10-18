@@ -46,8 +46,15 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
-// Cvar defined in pipeline_cache.cpp.
+// Cvars defined in pipeline_cache.cpp.
 REXCVAR_DECLARE(bool, vulkan_extended_dynamic_state);
+REXCVAR_DECLARE(std::string, depth_bias_shader);
+REXCVAR_DECLARE(int32_t, depth_bias_shader_units);
+
+// Defined in deferred_command_buffer.cpp (Fable 2 custom renderer).
+namespace rex::graphics::vulkan {
+bool fable2_ext_dyn_state_available(VkDevice device);
+}  // namespace rex::graphics::vulkan
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_UINT64(vulkan_fence_timeout_ns, 0, "GPU/Vulkan",
@@ -3883,38 +3890,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
   }
 
-  // Extended dynamic state (Fable 2 custom renderer): set topology, depth,
-  // rasterization, and color write mask dynamically to minimize the number
-  // of unique VkPipeline objects.
+  // Extended dynamic state (Fable 2 custom renderer): set rasterizer discard,
+  // cull mode, and front face dynamically to reduce pipeline variants.
+  // Topology and depth remain baked in the pipeline for correctness.
   if (REXCVAR_GET(vulkan_extended_dynamic_state) &&
-      GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr) {
+      fable2_ext_dyn_state_available(GetVulkanDevice()->device())) {
     DeferredCommandBuffer::ArgsVkSetExtendedDynamicState ext_state;
-    // Topology from the primitive processing result.
-    switch (primitive_processing_result.host_primitive_type) {
-      case xenos::PrimitiveType::kPointList:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-      case xenos::PrimitiveType::kLineList:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-      case xenos::PrimitiveType::kLineStrip:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
-      case xenos::PrimitiveType::kTriangleList:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-      case xenos::PrimitiveType::kTriangleStrip:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-      default:
-        ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-    }
+    ext_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;  // unused
     ext_state.primitive_restart_enable = VK_FALSE;
     ext_state.rasterizer_discard_enable = is_rasterization_done ? VK_FALSE : VK_TRUE;
-    // Depth state from the normalized depth control register.
+    ext_state.depth_test_enable = VK_TRUE;  // unused (not dynamic)
+    ext_state.depth_write_enable = VK_TRUE;  // unused (not dynamic)
+    ext_state.depth_compare_op = VK_COMPARE_OP_ALWAYS;  // unused (not dynamic)
     auto pa_sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-    bool depth_test_on = normalized_depth_control.z_enable ||
-                         normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
-    ext_state.depth_test_enable = depth_test_on ? VK_TRUE : VK_FALSE;
-    ext_state.depth_write_enable = normalized_depth_control.z_write_enable ? VK_TRUE : VK_FALSE;
-    ext_state.depth_compare_op = VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
-                                             uint32_t(normalized_depth_control.zfunc));
-    // Rasterization state from guest registers.
     ext_state.cull_mode = VK_CULL_MODE_NONE;
     if (pa_sc.cull_front) ext_state.cull_mode |= VK_CULL_MODE_FRONT_BIT;
     if (pa_sc.cull_back) ext_state.cull_mode |= VK_CULL_MODE_BACK_BIT;
@@ -4452,6 +4440,19 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  // Debug: log IssueCopy calls near the hero/dog address to diagnose the black hero.
+  static int s_issue_copy_debug = 0;
+  {
+    uint32_t dest_base = register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE];
+    // Log calls where the destination is near 0x12704000 (hero/dog texture)
+    if ((dest_base >= 0x12700000 && dest_base < 0x12710000) && s_issue_copy_debug < 24) {
+      REXGPU_INFO("[fable2-vk] IssueCopy near hero addr: #{} RB_COPY_DEST_BASE={:#010x} "
+                  "force_match={}",
+                  s_issue_copy_debug, dest_base,
+                  ShouldForceReadbackResolve(dest_base));
+      ++s_issue_copy_debug;
+    }
+  }
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
@@ -4717,8 +4718,21 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
-    return true;
+  } else {
+    // Submit the pending deferred commands (resolve + readback copy) to the GPU
+    // so that AwaitAllQueueOperationsCompletion actually waits for THIS work,
+    // not just previously submitted work. Without this, the CPU reads the
+    // readback buffer before the GPU has executed the copy.
+    if (!EndSubmission(false)) {
+      return true;
+    }
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return true;
+    }
+    // Re-open a submission for the rest of the frame's commands.
+    if (!BeginSubmission(true)) {
+      return true;
+    }
   }
 
   bool is_cache_miss = false;
@@ -4745,6 +4759,29 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      // Mark the range as CPU-modified so the texture cache re-uploads the
+      // new data to the GPU on the next sample. Without this, the GPU texture
+      // retains the old (black) data.
+      shared_memory_->MemoryInvalidationCallback(written_address, written_length, true);
+      // Debug: verify the readback produced non-zero data.
+      static int s_readback_verify = 0;
+      if (s_readback_verify < 8 && written_address >= 0x12700000 && written_address < 0x12710000) {
+        uint32_t first_pixel = *reinterpret_cast<uint32_t*>(readback.mapped_data[read_index]);
+        uint32_t mid_offset = written_length / 2;
+        uint32_t mid_pixel = *reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(readback.mapped_data[read_index]) + mid_offset);
+        REXGPU_INFO("[fable2-vk] readback verify: written_addr={:#010x} len={} "
+                    "first_pixel=0x{:08x} mid_pixel=0x{:08x} dest_valid=true",
+                    written_address, written_length, first_pixel, mid_pixel);
+        ++s_readback_verify;
+      }
+    } else {
+      static int s_readback_null = 0;
+      if (s_readback_null < 4 && written_address >= 0x12700000 && written_address < 0x12710000) {
+        REXGPU_INFO("[fable2-vk] readback FAIL: TranslatePhysical({:#010x}) returned null "
+                    "(len={})", written_address, written_length);
+        ++s_readback_null;
+      }
     }
   }
 
@@ -5791,6 +5828,24 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     // background is more likely.
     depth_bias_slope_factor *= xenos::kPolygonOffsetScaleSubpixelUnit *
                                float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    // Shader-specific depth bias (dog fur fix, matching D3D12 depth_bias_shader).
+    // D3D12 DepthBias units are 1/256 of the depth range; the Vulkan conversion
+    // factor (kD3D10PolygonOffsetFactor*) maps 1.0 to the full depth range, so
+    // divide by 256 to match the D3D12 magnitude.
+    const std::string& bias_shader = REXCVAR_GET(depth_bias_shader);
+    if (!bias_shader.empty() && active_pixel_shader()) {
+      auto* vulkan_pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
+      if (std::strtoull(bias_shader.c_str(), nullptr, 16) ==
+          vulkan_pixel_shader->ucode_data_hash()) {
+        depth_bias_constant_factor +=
+            REXCVAR_GET(depth_bias_shader_units) *
+            (regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                     xenos::DepthRenderTargetFormat::kD24S8
+                 ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+                 : draw_util::kD3D10PolygonOffsetFactorFloat24) /
+            256.0f;
+      }
+    }
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
     dynamic_depth_bias_update_needed_ |=

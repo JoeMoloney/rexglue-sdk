@@ -64,6 +64,20 @@ REXCVAR_DEFINE_BOOL(vulkan_extended_dynamic_state, true, "GPU/Vulkan",
                     "Requires Vulkan 1.2+ device. Set to false to restore baked state.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(depth_bias_shader, "", "GPU/Vulkan",
+                      "Shader hash (hex) that receives extra depth bias. Matches the D3D12 "
+                      "depth_bias_shader cvar for cross-backend parity.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(depth_bias_shader_units, 0, "GPU/Vulkan",
+                     "Extra depth bias units for depth_bias_shader (Vulkan).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Defined in deferred_command_buffer.cpp (Fable 2 custom renderer).
+namespace rex::graphics::vulkan {
+bool fable2_ext_dyn_state_available(VkDevice device);
+}  // namespace rex::graphics::vulkan
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -1108,19 +1122,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
     return false;
   }
 
-  // Extended dynamic state (Fable 2 custom renderer): zero out fields that are
-  // set dynamically at draw time so they don't contribute to the pipeline key.
-  // This collapses many state variants into a single pipeline object.
+  // Extended dynamic state (Fable 2 custom renderer): zero out cull and
+  // rasterizer discard so they don't contribute to the pipeline key. This
+  // collapses 8 cull/front-face variants into 1 per (shader, render pass,
+  // topology, depth state) combination. Depth state remains baked in the
+  // pipeline because dynamic override breaks the sky render pass.
   if (REXCVAR_GET(vulkan_extended_dynamic_state) &&
-      command_processor_.GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr) {
-    description.primitive_topology = PipelinePrimitiveTopology(0);
-    description.primitive_restart = 0;
+      fable2_ext_dyn_state_available(command_processor_.GetVulkanDevice()->device())) {
     description.cull_front = 0;
     description.cull_back = 0;
     description.front_face_clockwise = 0;
     description.rasterizer_discard = 0;
-    description.depth_write_enable = 0;
-    description.depth_compare_op = xenos::CompareFunction(0);
   }
 
   if (last_pipeline_ && last_pipeline_->first == description) {
@@ -3440,14 +3452,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // states when the cvar is enabled and the device supports them.
   bool extended_dynamic_state =
       REXCVAR_GET(vulkan_extended_dynamic_state) &&
-      command_processor_.GetVulkanDevice()->functions().vkCmdSetPrimitiveTopology != nullptr;
+      fable2_ext_dyn_state_available(command_processor_.GetVulkanDevice()->device());
   if (extended_dynamic_state) {
-    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
-    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;
-    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
-    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
-    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE;
   }
