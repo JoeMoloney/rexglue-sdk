@@ -32,6 +32,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
+#include <rex/graphics/vulkan/texture_transfer_trace.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -1140,8 +1141,30 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return false;
   }
 
+  const uint32_t trace_id = NextTextureTransferTraceId({
+      1, resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+      resolve_info.copy_dest_extent_length, resolve_info.coordinate_info.width_div_8,
+      resolve_info.height_div_8, register_file().values[XE_GPU_REG_RB_COPY_DEST_INFO],
+      register_file().values[XE_GPU_REG_RB_COPY_CONTROL]});
+  TextureTransferTraceResult trace_result(trace_id, "resolve");
+  if (trace_id) {
+    REXGPU_INFO("[vk-texture-trace] id={} stage=resolve frame={} raw_dest={:08X}",
+                trace_id, command_processor_.GetCurrentFrame(),
+                register_file().values[XE_GPU_REG_RB_COPY_DEST_BASE]);
+  }
+
   // Nothing to copy/clear.
+  if (trace_id) {
+    REXGPU_INFO(
+        "[vk-texture-trace] id={} dest={:08X} extent={:08X}+{:X} size={}x{} "
+        "format={} depth={} scaled={} path={}",
+        trace_id, resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length, resolve_info.coordinate_info.width_div_8 * 8,
+        resolve_info.height_div_8 * 8, uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        resolve_info.IsCopyingDepth(), draw_resolution_scaled, uint32_t(GetPath()));
+  }
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+    trace_result.SetOutcome("empty");
     return true;
   }
 
@@ -1374,6 +1397,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     cleared = true;
   }
 
+  if (trace_id) {
+    REXGPU_INFO("[vk-texture-trace] id={} written={:08X}+{:X} copied={} cleared={}",
+                trace_id, written_address_out, written_length_out, copied, cleared);
+  }
+  trace_result.SetOutcome(copied && cleared ? "recorded" : "failed");
   return copied && cleared;
 }
 

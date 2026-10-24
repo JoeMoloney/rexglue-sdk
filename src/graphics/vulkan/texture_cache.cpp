@@ -27,6 +27,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+#include <rex/graphics/vulkan/texture_transfer_trace.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
@@ -34,6 +35,11 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+
+REXCVAR_DEFINE_BOOL(vulkan_trace_texture_transfers, false, "GPU/Vulkan",
+                    "Log the first two events per transfer signature (up to 4096 signatures); "
+                    "enable immediately before loading a test scene. No pixel readback.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -1218,6 +1224,30 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 
+  const uint32_t trace_id = NextTextureTransferTraceId({
+      2, uint32_t(texture_key.base_page), uint32_t(texture_key.mip_page),
+      texture_key.GetWidth(), texture_key.GetHeight(), texture_key.GetDepthOrArraySize(),
+      uint32_t(texture_key.format) | (uint32_t(texture_key.mip_max_level) << 8) |
+          (uint32_t(texture_key.tiled) << 16) | (uint32_t(texture_key.packed_mips) << 17) |
+          (uint32_t(texture_key.scaled_resolve) << 18) |
+          (uint32_t(texture_key.endianness) << 20) | (uint32_t(texture_key.pitch) << 22),
+      uint32_t(load_base) | (uint32_t(load_mips) << 1) |
+          (uint32_t(texture_key.signed_separate) << 2)});
+  TextureTransferTraceResult trace_result(trace_id, "load");
+  if (trace_id) {
+    REXGPU_INFO(
+        "[vk-texture-trace] id={} stage=load frame={} base={:08X}+{:X} mips={:08X}+{:X} "
+        "size={}x{}x{} format={} max_mip={} tiled={} packed={} scaled={} "
+        "endian={} load_base={} load_mips={}",
+        trace_id, command_processor_.GetCurrentFrame(), uint32_t(texture_key.base_page << 12),
+        vulkan_texture.GetGuestBaseSize(), uint32_t(texture_key.mip_page << 12),
+        vulkan_texture.GetGuestMipsSize(), texture_key.GetWidth(), texture_key.GetHeight(),
+        texture_key.GetDepthOrArraySize(), uint32_t(texture_key.format),
+        uint32_t(texture_key.mip_max_level), bool(texture_key.tiled),
+        bool(texture_key.packed_mips), bool(texture_key.scaled_resolve),
+        uint32_t(texture_key.endianness), load_base, load_mips);
+  }
+
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
   bool host_format_is_signed;
@@ -1230,11 +1260,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       host_format_is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned;
   LoadShaderIndex load_shader = host_format.load_shader;
   if (load_shader == kLoadShaderIndexUnknown) {
+    trace_result.SetOutcome("unsupported-load-shader");
     return false;
   }
   VkPipeline pipeline = texture_key.scaled_resolve ? load_pipelines_scaled_[load_shader]
                                                    : load_pipelines_[load_shader];
   if (pipeline == VK_NULL_HANDLE) {
+    trace_result.SetOutcome("missing-load-pipeline");
     return false;
   }
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
@@ -1547,6 +1579,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
+    if (trace_id) {
+      REXGPU_INFO(
+          "[vk-texture-trace] id={} stored_level={} base={} guest_offset={:X} "
+          "row_pitch={} host_format={} load_shader={}",
+          trace_id, level, is_base, load_constants.guest_offset,
+          level_guest_layout.row_pitch_bytes, uint32_t(host_format.format),
+          uint32_t(load_shader));
+    }
     uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
     if (texture_key.tiled) {
       // Shaders expect pitch in blocks for tiled textures.
@@ -1783,6 +1823,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
   }
 
+  trace_result.SetOutcome("recorded");
   return true;
 }
 
