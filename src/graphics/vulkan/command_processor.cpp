@@ -44,6 +44,7 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
@@ -69,9 +70,30 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_capture_guest_frame, false, "GPU/Vulkan",
+                    "One-shot RenderDoc capture between guest swaps; requires launching "
+                    "under RenderDoc. Resets itself after consuming the request.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_capture_resolve_address, 0, "GPU/Vulkan",
+                     "One-shot RenderDoc capture starting before a resolve to this physical "
+                     "guest address and ending at the next guest swap. Zero disables.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+#if !REX_PLATFORM_MAC
+// Equivalent to newer headers' RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE:
+// RenderDoc identifies Vulkan devices by the instance's dispatch-table pointer,
+// not by the raw VkInstance handle. The vendored API header lacks that macro.
+RENDERDOC_DevicePointer GetRenderDocDevicePointer(VkInstance instance) {
+  RENDERDOC_DevicePointer pointer;
+  std::memcpy(&pointer, instance, sizeof(pointer));
+  return pointer;
+}
+#endif
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -1899,6 +1921,16 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+#if !REX_PLATFORM_MAC
+  if (renderdoc_guest_capture_active_) {
+    const auto* instance = GetVulkanDevice()->vulkan_instance();
+    if (const auto* renderdoc = instance->renderdoc_api()) {
+      renderdoc->api_1_0_0()->EndFrameCapture(
+          GetRenderDocDevicePointer(instance->instance()), nullptr);
+    }
+    renderdoc_guest_capture_active_ = false;
+  }
+#endif
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2271,6 +2303,31 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+bool VulkanCommandProcessor::BeginRenderDocGuestCapture() {
+#if !REX_PLATFORM_MAC
+  const auto* instance = GetVulkanDevice()->vulkan_instance();
+  const auto* renderdoc = instance->renderdoc_api();
+  if (!renderdoc) {
+    REXGPU_WARN("[vk-guest-capture] RenderDoc is not connected; request ignored");
+    return true;
+  }
+  const auto* api = renderdoc->api_1_0_0();
+  if (renderdoc_guest_capture_active_ || api->IsFrameCapturing()) {
+    REXGPU_WARN("[vk-guest-capture] Another RenderDoc capture is active; request ignored");
+    return true;
+  }
+  if (!EndSubmission(false)) {
+    REXGPU_ERROR("[vk-guest-capture] Could not flush the capture boundary");
+    return false;
+  }
+  api->StartFrameCapture(GetRenderDocDevicePointer(instance->instance()), nullptr);
+  renderdoc_guest_capture_active_ = api->IsFrameCapturing() != 0;
+  REXGPU_INFO("[vk-guest-capture] start at guest frame={} active={}",
+              frame_current_, renderdoc_guest_capture_active_);
+#endif
+  return true;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -2284,6 +2341,40 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
     return;
   }
+
+#if !REX_PLATFORM_MAC
+  // Host presentation can repaint between guest frames. RenderDoc's automatic
+  // present-to-present capture may then contain only a fullscreen UI blit.
+  // Explicitly bracket guest work and select the guest renderer's VkInstance.
+  if (renderdoc_guest_capture_active_ || REXCVAR_GET(vulkan_capture_guest_frame)) {
+    const auto* instance = GetVulkanDevice()->vulkan_instance();
+    const auto* renderdoc = instance->renderdoc_api();
+    if (!renderdoc) {
+      rex::cvar::SetFlagByName("vulkan_capture_guest_frame", "false");
+      renderdoc_guest_capture_active_ = false;
+      REXGPU_WARN("[vk-guest-capture] RenderDoc is not connected; request ignored");
+    } else {
+      const auto* api = renderdoc->api_1_0_0();
+      const auto device = GetRenderDocDevicePointer(instance->instance());
+      // Flush recorded commands before ending a capture, or before beginning
+      // one so no pre-capture recording straddles its boundary.
+      if (!EndSubmission(false)) {
+        REXGPU_ERROR("[vk-guest-capture] Could not flush the capture boundary");
+        return;
+      }
+      if (renderdoc_guest_capture_active_) {
+        const bool saved = api->EndFrameCapture(device, nullptr) != 0;
+        renderdoc_guest_capture_active_ = false;
+        REXGPU_INFO("[vk-guest-capture] ended at guest frame={} saved={}", frame_current_, saved);
+      } else {
+        rex::cvar::SetFlagByName("vulkan_capture_guest_frame", "false");
+        if (!BeginRenderDocGuestCapture()) {
+          return;
+        }
+      }
+    }
+  }
+#endif
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
@@ -4398,6 +4489,16 @@ bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  const int32_t capture_address = REXCVAR_GET(vulkan_capture_resolve_address);
+  if (capture_address > 0 &&
+      register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE] == uint32_t(capture_address)) {
+    rex::cvar::SetFlagByName("vulkan_capture_resolve_address", "0");
+    REXGPU_INFO("[vk-guest-capture] resolve trigger address={:08X}", uint32_t(capture_address));
+    if (!BeginRenderDocGuestCapture()) {
+      return false;
+    }
+  }
 
   if (!BeginSubmission(true)) {
     return false;

@@ -417,6 +417,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // opposed to simply resuming after mid-frame synchronization). Returns
   // whether a submission is open currently and the device is not lost.
   bool BeginSubmission(bool is_guest_command);
+  bool BeginRenderDocGuestCapture();
   // If is_swap is true, a full frame is closed - with, if needed, cache
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
@@ -540,6 +541,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  // Explicit RenderDoc capture spanning guest swaps, not host UI presents.
+  bool renderdoc_guest_capture_active_ = false;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
