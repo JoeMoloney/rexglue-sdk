@@ -32,7 +32,6 @@ endif()
 #=============================================================================
 set(REQUIRED_SUBMODULES
     cli11
-    libmspack
     FFmpeg
     tomlplusplus
     simde
@@ -72,6 +71,11 @@ foreach(submodule ${REQUIRED_SUBMODULES})
         )
     endif()
 endforeach()
+
+# This fork vendors libmspack as ordinary source files, not a git submodule.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack/lzxd.c")
+    message(FATAL_ERROR "Vendored libmspack sources are missing")
+endif()
 
 #=============================================================================
 # Header-only libraries (vendored, not in vcpkg)
