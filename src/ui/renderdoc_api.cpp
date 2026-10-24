@@ -12,6 +12,10 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
+#if REX_PLATFORM_LINUX
+#include <dlfcn.h>
+#endif
+
 namespace rex {
 namespace ui {
 
@@ -21,6 +25,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
   // Keep RenderDoc optional and simply report "not connected" on this platform.
   return nullptr;
 #else
+#if REX_PLATFORM_LINUX
+  // Load() uses dlopen, which would activate an installed RenderDoc even on
+  // ordinary launches. Only obtain the API when it was already injected.
+  void* existing = dlopen(platform::lib_names::kRenderDoc, RTLD_LAZY | RTLD_NOLOAD);
+  if (!existing) {
+    return nullptr;
+  }
+  dlclose(existing);
+#endif
   std::unique_ptr<RenderDocAPI> renderdoc_api(new RenderDocAPI());
 
   pRENDERDOC_GetAPI get_api = nullptr;
