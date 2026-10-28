@@ -47,6 +47,11 @@
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/util.h>
 
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+#include <renderer/native_vk_live_probe.h>
+#include <renderer/native_vk_triangle.h>
+#endif
+
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -74,6 +79,15 @@ REXCVAR_DEFINE_BOOL(vulkan_capture_guest_frame, false, "GPU/Vulkan",
                     "One-shot RenderDoc capture between guest swaps; requires launching "
                     "under RenderDoc. Resets itself after consuming the request.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+REXCVAR_DEFINE_BOOL(fable2_native_vk_probe, false, "GPU/Vulkan/Experimental",
+                    "One-shot, non-destructive live Vulkan draw-path probe")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fable2_native_vk_triangle, false, "GPU/Vulkan/Experimental",
+                    "Draw an experimental native Vulkan triangle over the guest output")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
 
 REXCVAR_DEFINE_INT32(vulkan_capture_resolve_address, 0, "GPU/Vulkan",
                      "One-shot RenderDoc capture starting before a resolve to this physical "
@@ -1791,6 +1805,111 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+  // Build this only when explicitly requested. The pipeline is compatible with
+  // the existing final guest-output render pass; it has no guest descriptors,
+  // vertex buffers, depth attachment, or Xenos-state dependencies.
+  if (REXCVAR_GET(fable2_native_vk_triangle)) {
+    std::vector<uint32_t> triangle_vertex_spirv;
+    std::vector<uint32_t> triangle_fragment_spirv;
+    std::string triangle_compile_error;
+    if (!CompileGlslToSpirv(VK_SHADER_STAGE_VERTEX_BIT,
+                            fable2::nativevk::kTriangleVertexShader,
+                            triangle_vertex_spirv, triangle_compile_error) ||
+        !CompileGlslToSpirv(VK_SHADER_STAGE_FRAGMENT_BIT,
+                            fable2::nativevk::kTriangleFragmentShader,
+                            triangle_fragment_spirv, triangle_compile_error)) {
+      REXGPU_WARN("[fable2-native-vk-triangle] shader compile failed: {}",
+                  triangle_compile_error);
+    } else {
+      VkShaderModule triangle_vertex_module = ui::vulkan::util::CreateShaderModule(
+          vulkan_device, triangle_vertex_spirv.data(),
+          sizeof(uint32_t) * triangle_vertex_spirv.size());
+      VkShaderModule triangle_fragment_module = ui::vulkan::util::CreateShaderModule(
+          vulkan_device, triangle_fragment_spirv.data(),
+          sizeof(uint32_t) * triangle_fragment_spirv.size());
+      if (triangle_vertex_module == VK_NULL_HANDLE ||
+          triangle_fragment_module == VK_NULL_HANDLE) {
+        REXGPU_WARN("[fable2-native-vk-triangle] shader module creation failed");
+      } else {
+        VkPipelineLayoutCreateInfo triangle_layout_info{};
+        triangle_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        if (dfn.vkCreatePipelineLayout(device, &triangle_layout_info, nullptr,
+                                       &fable2_native_triangle_pipeline_layout_) == VK_SUCCESS) {
+          VkPipelineShaderStageCreateInfo stages[2]{};
+          stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+          stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+          stages[0].module = triangle_vertex_module;
+          stages[0].pName = "main";
+          stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+          stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+          stages[1].module = triangle_fragment_module;
+          stages[1].pName = "main";
+
+          VkPipelineVertexInputStateCreateInfo vertex_input{};
+          vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+          VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+          input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+          input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+          VkPipelineViewportStateCreateInfo viewport_state{};
+          viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+          viewport_state.viewportCount = 1;
+          viewport_state.scissorCount = 1;
+          VkPipelineRasterizationStateCreateInfo rasterization{};
+          rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+          rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+          rasterization.cullMode = VK_CULL_MODE_NONE;
+          rasterization.lineWidth = 1.0f;
+          VkPipelineMultisampleStateCreateInfo multisample{};
+          multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+          multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+          VkPipelineColorBlendAttachmentState blend_attachment{};
+          blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+          VkPipelineColorBlendStateCreateInfo blend{};
+          blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+          blend.attachmentCount = 1;
+          blend.pAttachments = &blend_attachment;
+          const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR};
+          VkPipelineDynamicStateCreateInfo dynamic_state{};
+          dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+          dynamic_state.dynamicStateCount = uint32_t(rex::countof(dynamic_states));
+          dynamic_state.pDynamicStates = dynamic_states;
+          VkGraphicsPipelineCreateInfo pipeline_info{};
+          pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+          pipeline_info.stageCount = uint32_t(rex::countof(stages));
+          pipeline_info.pStages = stages;
+          pipeline_info.pVertexInputState = &vertex_input;
+          pipeline_info.pInputAssemblyState = &input_assembly;
+          pipeline_info.pViewportState = &viewport_state;
+          pipeline_info.pRasterizationState = &rasterization;
+          pipeline_info.pMultisampleState = &multisample;
+          pipeline_info.pColorBlendState = &blend;
+          pipeline_info.pDynamicState = &dynamic_state;
+          pipeline_info.layout = fable2_native_triangle_pipeline_layout_;
+          pipeline_info.renderPass = swap_apply_gamma_render_pass_;
+          if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                            nullptr, &fable2_native_triangle_pipeline_) ==
+              VK_SUCCESS) {
+            REXGPU_INFO("[fable2-native-vk-triangle] created native overlay pipeline");
+          } else {
+            REXGPU_WARN("[fable2-native-vk-triangle] pipeline creation failed");
+            ui::vulkan::util::DestroyAndNullHandle(
+                dfn.vkDestroyPipelineLayout, device, fable2_native_triangle_pipeline_layout_);
+          }
+        } else {
+          REXGPU_WARN("[fable2-native-vk-triangle] pipeline layout creation failed");
+        }
+      }
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                             triangle_vertex_module);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                             triangle_fragment_module);
+    }
+  }
+#endif  // FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+
   // Gamma ramp application compute pipelines.
   swap_apply_gamma_compute_256_entry_table_pipeline_ = ui::vulkan::util::CreateComputePipeline(
       vulkan_device, swap_apply_gamma_compute_pipeline_layout_, shaders::apply_gamma_table_cs,
@@ -2018,6 +2137,10 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_apply_gamma_256_entry_table_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_256_entry_table_fxaa_luma_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         fable2_native_triangle_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         fable2_native_triangle_pipeline_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                          swap_apply_gamma_render_pass_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
@@ -2605,6 +2728,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+        bool draw_native_triangle = false;
+        if (REXCVAR_GET(fable2_native_vk_triangle) && !use_fxaa &&
+            fable2_native_triangle_pipeline_ != VK_NULL_HANDLE) {
+          VkPipeline graphics_gamma_pipeline = use_pwl_gamma_ramp
+                                                   ? swap_apply_gamma_pwl_pipeline_
+                                                   : swap_apply_gamma_256_entry_table_pipeline_;
+          if (!vulkan_device->properties().imageViewFormatSwizzle &&
+              swap_source_needs_rb_swap) {
+            VkPipeline rb_swap_pipeline = use_pwl_gamma_ramp
+                                              ? swap_apply_gamma_pwl_rb_swap_pipeline_
+                                              : swap_apply_gamma_256_entry_table_rb_swap_pipeline_;
+            if (rb_swap_pipeline != VK_NULL_HANDLE) {
+              graphics_gamma_pipeline = rb_swap_pipeline;
+            }
+          }
+          // Draw in the existing final-output render pass, after gamma. This
+          // keeps Xenos render targets/state untouched and adds no new image,
+          // queue, or synchronization ownership.
+          draw_native_triangle = graphics_gamma_pipeline != VK_NULL_HANDLE;
+          if (draw_native_triangle) {
+            use_compute_gamma = false;
+          }
+        }
+#endif  // FABLE2_EXPERIMENTAL_NATIVE_VULKAN
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
@@ -2997,8 +3145,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               VK_PIPELINE_BIND_POINT_GRAPHICS, swap_apply_gamma_pipeline_layout_, 0,
               uint32_t(swap_descriptor_sets.size()), swap_descriptor_sets.data(), 0, nullptr);
 
-          deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
-          deferred_command_buffer_.CmdVkEndRenderPass();
+           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+           if (draw_native_triangle) {
+             BindExternalGraphicsPipeline(fable2_native_triangle_pipeline_);
+             fable2::nativevk::RecordTriangleDraw(deferred_command_buffer_);
+             if (!fable2_native_triangle_draw_logged_) {
+               fable2_native_triangle_draw_logged_ = true;
+               REXGPU_INFO("[fable2-native-vk-triangle] recorded draw in final guest-output pass frame={}",
+                           frame_current_);
+             }
+           }
+#endif
+           deferred_command_buffer_.CmdVkEndRenderPass();
 
           // Insert the release barrier.
           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
@@ -4027,6 +4186,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+
+#ifdef FABLE2_EXPERIMENTAL_NATIVE_VULKAN
+  // Opt-in one-shot operation: enqueue project-owned Vulkan code at a real
+  // guest draw boundary, after Xenos state interpretation and dynamic-state
+  // setup. The helper records the exact current scissor again; DeferredCommandBuffer
+  // executes it through the backend device's vkCmdSetScissor dispatch.
+  static bool native_vk_probe_recorded = false;
+  if (!native_vk_probe_recorded && REXCVAR_GET(fable2_native_vk_probe)) {
+    fable2::nativevk::RecordLiveDrawProbe(deferred_command_buffer_, dynamic_scissor_);
+    native_vk_probe_recorded = true;
+    REXGPU_INFO("[fable2-native-vk] recorded one-shot live draw probe");
+  }
+#endif
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 

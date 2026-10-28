@@ -675,6 +675,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineLayout swap_apply_gamma_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout swap_apply_gamma_compute_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout swap_fxaa_pipeline_layout_ = VK_NULL_HANDLE;
+  // Experimental Fable II overlay pipeline, compatible with the final guest
+  // output pass. It owns no vertex/index buffers and is destroyed with this
+  // command processor's Vulkan context.
+  VkPipelineLayout fable2_native_triangle_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fable2_native_triangle_pipeline_ = VK_NULL_HANDLE;
+  bool fable2_native_triangle_draw_logged_ = false;
   // Has no dependencies on specific pipeline stages on both ends to simplify
   // use in different scenarios with different pipelines - use explicit barriers
   // for synchronization.
