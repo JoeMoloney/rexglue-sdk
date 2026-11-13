@@ -13,6 +13,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
@@ -320,6 +321,16 @@ class PosixConditionBase {
     }
   }
 
+  // One of these lives on the stack of each thread inside WaitMultiple().
+  // It is registered on every handle being waited on; whenever one of those
+  // handles becomes signaled it bumps `generation` and wakes the waiter, so
+  // the waiter sleeps in the kernel instead of polling.
+  struct MultiWaiter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t generation = 0;  // Protected by mutex.
+  };
+
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
                                                     std::chrono::milliseconds timeout) {
@@ -330,93 +341,92 @@ class PosixConditionBase {
       return std::make_pair(result, 0);
     }
 
-    auto start_time = std::chrono::steady_clock::now();
-    auto end_time = (timeout == std::chrono::milliseconds::max())
-                        ? std::chrono::steady_clock::time_point::max()
-                        : start_time + timeout;
+    const bool infinite = timeout == std::chrono::milliseconds::max();
+    const auto end_time = infinite ? std::chrono::steady_clock::time_point::max()
+                                   : std::chrono::steady_clock::now() + timeout;
+
+    // Always lock handles in one global order (by address, duplicates
+    // removed) so two threads waiting on overlapping sets cannot deadlock.
+    std::vector<PosixConditionBase*> lock_order(handles);
+    std::sort(lock_order.begin(), lock_order.end());
+    lock_order.erase(std::unique(lock_order.begin(), lock_order.end()), lock_order.end());
+
+    MultiWaiter waiter;
+    for (auto* handle : lock_order) {
+      if (!handle->LockMutex()) {
+        for (auto* registered : lock_order) {
+          if (registered == handle) break;
+          registered->UnregisterMultiWaiter(&waiter);
+        }
+        return std::make_pair<WaitResult, size_t>(WaitResult::kFailed, 0);
+      }
+      handle->multi_waiters_.push_back(&waiter);
+      handle->mutex_.unlock();
+    }
+    struct Unregister {
+      std::vector<PosixConditionBase*>& order;
+      MultiWaiter* waiter;
+      ~Unregister() {
+        for (auto* handle : order) handle->UnregisterMultiWaiter(waiter);
+      }
+    } unregister{lock_order, &waiter};
 
     while (true) {
+      // Snapshot the generation *before* checking the handles. If a handle is
+      // signaled after our check, the generation will differ and the wait
+      // below returns immediately, so no wake-up can be lost.
+      uint64_t seen_generation;
+      {
+        std::lock_guard<std::mutex> lock(waiter.mutex);
+        seen_generation = waiter.generation;
+      }
+
+      size_t locked = 0;
+      for (; locked < lock_order.size(); ++locked) {
+        if (!lock_order[locked]->LockMutex()) break;
+      }
+      if (locked != lock_order.size()) {
+        for (size_t i = 0; i < locked; ++i) lock_order[i]->mutex_.unlock();
+        return std::make_pair<WaitResult, size_t>(WaitResult::kFailed, 0);
+      }
+
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
-      bool all_locked = true;
-
-      std::vector<std::unique_lock<std::mutex>> locks;
-      locks.reserve(handles.size());
-
-      for (size_t i = 0; i < handles.size(); ++i) {
-#if REX_PLATFORM_LINUX
-        auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-        int result = pthread_mutex_trylock(native_mutex);
-        if (result == 0 || result == EOWNERDEAD) {
-          if (result == EOWNERDEAD) {
-            pthread_mutex_consistent(native_mutex);
-          }
-          locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
-        } else {
-          all_locked = false;
-          break;
-        }
-#else
-        locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
-        if (!locks.back().owns_lock()) {
-          all_locked = false;
-          break;
-        }
-#endif
-      }
-
-      if (!all_locked) {
-        locks.clear();
-        std::this_thread::yield();
-        continue;
-      }
-
       if (wait_all) {
-        bool all_signaled = true;
+        condition_met = true;
         for (size_t i = 0; i < handles.size(); ++i) {
           if (!handles[i]->signaled()) {
-            all_signaled = false;
+            condition_met = false;
             break;
           }
-          if (first_signaled == std::numeric_limits<size_t>::max()) {
-            first_signaled = i;
-          }
         }
-        condition_met = all_signaled;
+        first_signaled = 0;
+        if (condition_met) {
+          for (size_t i = 0; i < handles.size(); ++i) handles[i]->post_execution();
+        }
       } else {
         for (size_t i = 0; i < handles.size(); ++i) {
           if (handles[i]->signaled()) {
             first_signaled = i;
             condition_met = true;
+            handles[i]->post_execution();
             break;
           }
         }
       }
 
+      for (auto* handle : lock_order) handle->mutex_.unlock();
+
       if (condition_met) {
-        if (wait_all) {
-          for (size_t i = 0; i < handles.size(); ++i) {
-            handles[i]->post_execution();
-          }
-        } else {
-          handles[first_signaled]->post_execution();
-        }
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
-      locks.clear();
-
-      auto now = std::chrono::steady_clock::now();
-      if (now >= end_time) {
+      std::unique_lock<std::mutex> lock(waiter.mutex);
+      auto changed = [&] { return waiter.generation != seen_generation; };
+      if (infinite) {
+        waiter.cv.wait(lock, changed);
+      } else if (!waiter.cv.wait_until(lock, end_time, changed)) {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
-      }
-
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
       }
     }
   }
@@ -428,8 +438,46 @@ class PosixConditionBase {
  protected:
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+
+  // Wakes single-handle waiters (cond_) and any WaitMultiple() waiters.
+  // Must be called with mutex_ held.
+  void NotifyAllLocked() {
+    cond_.notify_all();
+    for (auto* waiter : multi_waiters_) {
+      {
+        std::lock_guard<std::mutex> lock(waiter->mutex);
+        ++waiter->generation;
+      }
+      waiter->cv.notify_one();
+    }
+  }
+
+  // Locks mutex_, recovering it if a previous owner thread died.
+  bool LockMutex() {
+#if REX_PLATFORM_LINUX
+    auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+    int result = pthread_mutex_lock(native_mutex);
+    if (result == EOWNERDEAD) {
+      pthread_mutex_consistent(native_mutex);
+      return true;
+    }
+    return result == 0;
+#else
+    mutex_.lock();
+    return true;
+#endif
+  }
+
+  void UnregisterMultiWaiter(MultiWaiter* waiter) {
+    if (!LockMutex()) return;
+    auto it = std::find(multi_waiters_.begin(), multi_waiters_.end(), waiter);
+    if (it != multi_waiters_.end()) multi_waiters_.erase(it);
+    mutex_.unlock();
+  }
+
   std::condition_variable cond_;
   std::mutex mutex_;
+  std::vector<MultiWaiter*> multi_waiters_;  // Protected by mutex_.
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -449,7 +497,7 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAllLocked();
     return true;
   }
 
@@ -486,7 +534,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    NotifyAllLocked();
     return true;
   }
 
@@ -518,7 +566,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        cond_.notify_all();
+        NotifyAllLocked();
       }
       return true;
     }
@@ -550,7 +598,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
   bool Signal() override {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAllLocked();
     return true;
   }
 
@@ -978,7 +1026,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      NotifyAllLocked();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1448,7 +1496,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
+    thread->handle_.NotifyAllLocked();
   }
 
   current_thread_ = nullptr;
